@@ -1,0 +1,34 @@
+# gitleaks config. gitleaks loads it automatically from the repo root.
+# To ignore one finding (e.g. a restricted API key), add its fingerprint to .gitleaksignore.
+
+# Keep the ~200 built-in rules; without this, this file would mean zero rules.
+[extend]
+useDefault = true
+
+# ── Mobile signing material the built-in rules miss (added by ai-setup) ─────
+[[rules]]
+id = "android-keystore-file"
+description = "Android keystore committed"
+path = '''(?i)\.(jks|keystore)$'''
+
+[[rules]]
+id = "android-signing-password"
+description = "Android signing password"
+regex = '''(?i)(storePassword|keyPassword)\s*[=:]\s*['"]?([^\s'"]{4,})'''
+secretGroup = 2
+[rules.allowlist]
+regexes = ['''keystoreProperties\[''']   # build.gradle reading from key.properties
+
+[[rules]]
+id = "apple-signing-file"
+description = "Apple key, certificate or provisioning profile"
+path = '''(?i)\.(p8|p12|mobileprovision)$'''
+
+[[rules]]
+id = "google-service-account"
+description = "Google service account JSON"
+regex = '''"type"\s*:\s*"service_account"'''
+
+# Firebase client config is public by design: don't flag it.
+[allowlist]
+paths = ['''google-services\.json$''', '''GoogleService-Info\.plist$''', '''firebase_options\.dart$''']
