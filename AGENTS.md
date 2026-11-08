@@ -57,5 +57,3 @@ Write commit messages as if authored by the user.
 - Default to the safe form: back up first (`cp -n`, `mv x x.bak`), omit force flags (`-f`, `--force`, `--hard`), or use a dry run (`-n`, `--dry-run`).
 - If the destructive form is really needed, ask for my confirmation before giving or running it.
 - This applies to commands you hand me to run manually, not only commands you run yourself.
-
-@~/.agents/AGENTS.md

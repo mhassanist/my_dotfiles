@@ -415,7 +415,16 @@ fix_global() {
 }
 fix_claude_global() { local f="$HOME/.claude/CLAUDE.md"; mkdir -p "$HOME/.claude"; backup "$f"; printf '\n@~/.agents/AGENTS.md\n' >> "$f"; }
 fix_codex_link() { mkdir -p "$HOME/.codex"; ln -s "$G" "$HOME/.codex/AGENTS.md"; }
-if [ -f "$G" ]; then ok "~/.agents/AGENTS.md exists"
+# The real guide lives in this setup's folder ($MINE); ~/.agents/AGENTS.md should link to it.
+fix_global_link() {
+  local b="$G.bak-$(date +%Y%m%d%H%M%S)"
+  mv -n "$G" "$b" && note "moved the old copy to $b" && ln -s "$MINE" "$G"
+}
+if [ -L "$G" ] && [ "$(readlink "$G")" = "$MINE" ]; then ok "~/.agents/AGENTS.md links to $MINE"
+elif [ -f "$G" ] && [ -f "$MINE" ] && [ ! -L "$G" ]; then
+  offer_warn "~/.agents/AGENTS.md is a separate copy, not a link to $MINE (they'll drift)" \
+    "replace it with a link (the copy is kept as .bak; merge anything you need from it)" fix_global_link
+elif [ -f "$G" ]; then ok "~/.agents/AGENTS.md exists"
 else offer_warn "no global guide at ~/.agents/AGENTS.md" "create it" fix_global; fi
 if [ -f "$G" ]; then
   grep -qF '@~/.agents/AGENTS.md' "$HOME/.claude/CLAUDE.md" 2>/dev/null && ok "~/.claude/CLAUDE.md imports it" \
