@@ -11,7 +11,7 @@ for d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
   dest="$d/ai-setup"
   if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then echo "= already linked: $dest"; exit 0; fi
   if [ -e "$dest" ] || [ -L "$dest" ]; then echo "! $dest already exists and isn't this script; left alone." >&2; exit 1; fi
-  ln -s "$src" "$dest" && echo "+ linked $dest -> $src" && echo "Try: ai-setup --help"
+  ln -s "$src" "$dest" && echo "+ linked $dest -> $src" && echo "Next: ai-setup machine"
   exit $?
 done
 echo "No writable folder on your PATH found. Add this line to ~/.zshrc instead:"

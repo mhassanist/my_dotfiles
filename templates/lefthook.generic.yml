@@ -31,6 +31,9 @@ pre-push:
       run: gitleaks git --no-banner --redact --log-opts="HEAD --not --remotes"
     - name: test
       run: @@TEST@@
+    - name: agent-guide-links
+      # Re-points every agent's global guide at ~/.ai-msaudi/AGENTS.md. Skipped if ai-setup isn't installed.
+      run: command -v ai-setup >/dev/null 2>&1 && ai-setup link --quiet || true
     - name: ai-review-reminder
       run: >-
         printf "\n\033[1;33m⚡ Run an AI code review (e.g. /code-review in Claude Code) before opening a PR.\033[0m\n\n"

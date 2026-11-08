@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# ai-setup: checks a repo's AI dev setup and offers to fix what's missing.
-#   Agent guides  root AGENTS.md with a Memory section; a CLAUDE.md importing each AGENTS.md
-#   Memory        memory/progress.md and memory/decision.md, tracked by git
-#   Security      tools in tools/security_tools.conf installed; gitleaks config + canary
-#   Git hooks     lefthook.yml runs gitleaks, the tests and the AI review reminder; hooks installed
-#   CI            warns if no CI runs gitleaks (hooks can be skipped, CI can't)
-#   Guardrails    Claude Code deny rules: no --no-verify, no edits to hook/security config
-#   Global guide  ~/.agents/AGENTS.md, imported by Claude, linked for Codex
-#   Architecture  (Flutter repos) no Cubit imports Dio, an API client or a data source
+# ai-setup: my AI dev setup, from one folder (~/.ai-msaudi).
 #
-# Usage: ai-setup [--check | --yes] [--push] [path]
-#   (default)  asks y/N before each fix
-#   --check    report only, never changes anything (automatic when not run in a terminal)
-#   --yes      applies every offered fix without asking
-#   --push     also warns if code changed on this branch but memory/progress.md didn't
-#   path       any folder inside the repo (default: the current folder)
-# Never overwrites or deletes. A file it appends to is backed up first unless git
-# can restore it. Exit 1 on any unfixed ✗; warnings (!) never fail. Exit 2 = bad usage.
+#   ai-setup link [--check] [--quiet]
+#       Points every installed agent's global guide at ~/.ai-msaudi/AGENTS.md.
+#       Runs on its own (no questions) so the pre-push hook can call it.
+#
+#   ai-setup [--check | --yes] [path]
+#       Sets up and checks a code repo (default: the current folder):
+#       memory (AGENTS.md Memory section, CLAUDE.md import, memory/*.md), lefthook hooks
+#       (gitleaks, analyze, tests, AI review reminder), .gitleaks.toml, analysis_options.yaml
+#       (Flutter), tools from tools.conf (warn only), and the agent guide links.
+#       Asks y/N before each change; --check only reports; --yes applies everything.
+#
+# Never deletes: anything replaced is kept as <file>.bak-<time> (unless git can restore it).
 set -uo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -24,447 +20,213 @@ while [ -L "$src" ]; do
   d=$(cd -P "$(dirname "$src")" && pwd); src=$(readlink "$src")
   case "$src" in /*) ;; *) src="$d/$src" ;; esac
 done
-HERE=$(cd -P "$(dirname "$src")" && pwd)
-TPL="$HERE/templates"
+ROOT=$(cd -P "$(dirname "$src")/.." && pwd)        # ~/.ai-msaudi
+GUIDE="$ROOT/AGENTS.md"
+TPL="$ROOT/templates"
+TOOLS="$ROOT/tools.conf"
 
-MODE=ask; PUSH=0; TARGET=""
-for arg in "$@"; do
-  case "$arg" in
-    --check) MODE=check ;;
-    --yes|-y) MODE=yes ;;
-    --push) PUSH=1 ;;
-    -h|--help) sed -n '2,20p' "$HERE/ai-setup"; exit 0 ;;
-    -*) echo "Unknown option: $arg" >&2; exit 2 ;;
-    *) [ -n "$TARGET" ] && { echo "Only one path allowed" >&2; exit 2; }; TARGET="$arg" ;;
-  esac
-done
-if [ "$MODE" = ask ] && ! { [ -t 0 ] && [ -t 1 ]; }; then MODE=check; fi
+# Every known agent's global guide file. Add a line to support another agent.
+# The first one is always created; the others only where the agent is installed.
+AGENT_FILES="$HOME/.agents/AGENTS.md
+$HOME/.claude/CLAUDE.md
+$HOME/.claude-blink/CLAUDE.md
+$HOME/.codex/AGENTS.md
+$HOME/.gemini/GEMINI.md
+$HOME/.config/opencode/AGENTS.md"
 
-if [ -n "$TARGET" ]; then
-  [ -d "$TARGET" ] || { echo "Not a folder: $TARGET" >&2; exit 2; }
-  cd "$TARGET" || exit 2
-fi
-root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "Not inside a git repo: ${TARGET:-$PWD}" >&2; exit 2; }
-cd "$root" || exit 2
-printf 'Checking %s\n\n' "$root"
-
-fail=0; fixed=0; MAX_LINES=200
+# ── output and prompts ────────────────────────────────────────────────────────
+fail=0; QUIET=0
 err()  { printf '\033[1;31m✗ %s\033[0m\n' "$1"; fail=1; }
-bad()  { printf '\033[1;31m✗ %s\033[0m\n' "$1"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$1"; }
-ok()   { printf '✓ %s\n' "$1"; }
+ok()   { [ "$QUIET" -eq 1 ] || printf '✓ %s\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
-done_fix() { printf '    \033[1;32m✓ fixed\033[0m\n'; fixed=$((fixed+1)); }
-
-# ask "question" → 0 = go ahead. Reads the terminal, not stdin.
-ask() {
-  case "$MODE" in
-    check) return 1 ;;
-    yes) note "→ $1: yes (--yes)"; return 0 ;;
-  esac
+ask() {  # ask "question" → 0 = go ahead
+  case "$MODE" in check) return 1 ;; yes) return 0 ;; esac
   local a; printf '    → %s? [y/N] ' "$1"; read -r a < /dev/tty || a=""
   case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
-# ask_value "question" "default" → prints the answer
-ask_value() {
-  local a
-  [ "$MODE" = yes ] && { printf '%s' "$2"; return; }
-  printf '    → %s [%s]: ' "$1" "$2" > /dev/tty; read -r a < /dev/tty || a=""
-  printf '%s' "${a:-$2}"
+ask_value() {  # ask_value "question" "default"
+  local a; [ "$MODE" = yes ] && { printf '%s' "$2"; return; }
+  printf '    → %s [%s]: ' "$1" "$2" > /dev/tty; read -r a < /dev/tty || a=""; printf '%s' "${a:-$2}"
 }
-# offer "problem" "fix" cmd... : a declined or failed fix counts as a failure
-offer() {
+# fix "problem" "question" cmd...: ✗ unless the fix is applied
+fix() {
   local problem="$1" q="$2"; shift 2
-  bad "$problem"
-  if ask "$q"; then
-    if "$@"; then done_fix; return 0; fi
-    note "fix failed"
+  if ask "$problem. $q"; then
+    if "$@"; then printf '\033[1;32m✓ fixed: %s\033[0m\n' "$problem"; return 0; fi
+    err "$problem (fix failed)"; return 1
   fi
-  fail=1; return 1
+  err "$problem"
 }
-# offer_warn: same, but declining leaves only a warning
-offer_warn() {
-  local problem="$1" q="$2"; shift 2
-  warn "$problem"
-  if ask "$q"; then
-    if "$@"; then done_fix; return 0; fi
-    note "fix failed"
-  fi
-  return 1
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+bakname() {
+  local b i=1; b="$1.bak-$(date +%Y%m%d%H%M%S)"
+  while [ -e "$b" ] || [ -L "$b" ]; do b="$1.bak-$(date +%Y%m%d%H%M%S)-$i"; i=$((i+1)); done
+  printf '%s' "$b"
 }
-# backup FILE: copy to FILE.bak-<time> unless git can restore it (tracked and unchanged)
-backup() {
-  local f="$1" b
-  [ -f "$f" ] || return 0
-  if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 && git diff --quiet -- "$f" 2>/dev/null; then return 0; fi
-  b="$f.bak-$(date +%Y%m%d%H%M%S)"; local i=1
-  while [ -e "$b" ]; do b="$f.bak-$(date +%Y%m%d%H%M%S)-$i"; i=$((i+1)); done
-  cp -p "$f" "$b" && note "backed up $f to $b"
-}
-brew_install() {
-  command -v brew >/dev/null 2>&1 || { note "Homebrew isn't installed"; return 1; }
-  brew install "$1" && command -v "$1" >/dev/null 2>&1
+backup() {  # copy a file aside unless git can restore it
+  [ -f "$1" ] || return 0
+  if git ls-files --error-unmatch -- "$1" >/dev/null 2>&1 && git diff --quiet -- "$1" 2>/dev/null; then return 0; fi
+  local b; b=$(bakname "$1"); cp -p "$1" "$b" && note "backed up $1 to $b"
 }
 
-# ── fixes ─────────────────────────────────────────────────────────────────────
-fix_root_agents()   { [ -e AGENTS.md ] || cp "$TPL/AGENTS.md" AGENTS.md; note "created AGENTS.md: fill in the project name and build commands"; }
-fix_memory_section(){ backup AGENTS.md; { printf '\n'; cat "$TPL/memory-section.md"; } >> AGENTS.md; }
-fix_claude_import() {
-  local f="$1/CLAUDE.md"
-  if [ -f "$f" ]; then backup "$f"; printf '\n@AGENTS.md\n' >> "$f"; else printf '@AGENTS.md\n' > "$f"; fi
-}
-fix_app_agents() {
-  local app="$1" name; name=$(basename "$1")
-  printf '# %s\n\nFollow the root [AGENTS.md](../../AGENTS.md) first; this file only adds rules for %s.\n' "$name" "$name" > "$app/AGENTS.md"
-  [ -e "$app/CLAUDE.md" ] || printf '@AGENTS.md\n' > "$app/CLAUDE.md"
-}
-fix_memory_file() { mkdir -p memory; [ -e "$1" ] || cp "$TPL/$1" "$1"; git add -- "$1" && note "staged $1 (commit it with your next change)"; }
-fix_conf() { mkdir -p tools; [ -e tools/security_tools.conf ] || cp "$TPL/security_tools.conf" tools/security_tools.conf; note "created tools/security_tools.conf: edit it to change what this repo requires"; }
-guess_test_cmd() {
-  if [ -f package.json ]; then echo "npm test"
-  elif [ -f go.mod ]; then echo "go test ./..."
-  elif [ -f Cargo.toml ]; then echo "cargo test"
-  elif [ -f pyproject.toml ] || [ -f requirements.txt ]; then echo "pytest"
-  fi
-}
-make_lefthook() {
-  local content cmd fl da
-  if [ -f pubspec.yaml ]; then
-    fl=flutter; da=dart
-    if [ -f .fvmrc ] || command -v fvm >/dev/null 2>&1; then fl="fvm flutter"; da="fvm dart"; fi
-    if [ ! -f .fvmrc ]; then
-      note "No .fvmrc here. Git hooks don't see shell aliases, so give the real commands."
-      fl=$(ask_value "Flutter command (e.g. fvm spawn 3.47.2)" "$fl")
-      da=$(ask_value "Dart command" "$da")
+# ── link: agent guides ────────────────────────────────────────────────────────
+link_guides() {  # link_guides check|fix
+  local f first=1 b
+  [ -f "$GUIDE" ] || { err "no $GUIDE"; return; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -L "$f" ] && [ "$(readlink "$f")" = "$GUIDE" ]; then
+      ok "$(tilde "$f") → $(tilde "$GUIDE")"
+    elif [ "$first" -eq 0 ] && [ ! -d "$(dirname "$f")" ]; then
+      :  # agent not installed here
+    elif [ "$1" = check ]; then
+      warn "$(tilde "$f") doesn't point to $(tilde "$GUIDE") (run: ai-setup link)"
+    else
+      mkdir -p "$(dirname "$f")"
+      if [ -e "$f" ] || [ -L "$f" ]; then b=$(bakname "$f"); mv -n "$f" "$b" || { err "can't move $f aside"; first=0; continue; }; fi
+      if ln -s "$GUIDE" "$f"; then
+        printf '\033[1;32m✓ linked %s → '"$(tilde "$GUIDE")"'\033[0m%s\n' "$(tilde "$f")" "${b:+ (old one kept as $(tilde "$b"))}"
+      else err "can't link $f"; fi
+      b=""
     fi
-    content=$(cat "$TPL/lefthook.flutter.yml")
-    content=${content//@@FLUTTER@@/"$fl"}; content=${content//@@DART@@/"$da"}
-  else
-    cmd=$(ask_value "Test command for pre-push" "$(guess_test_cmd)")
-    [ -n "$cmd" ] || { note "no test command given"; return 1; }
-    content=$(cat "$TPL/lefthook.generic.yml"); content=${content//@@TEST@@/"$cmd"}
-  fi
-  backup lefthook.yml
-  printf '%s\n' "$content" > lefthook.yml && note "wrote lefthook.yml: review it, then commit"
-}
-fix_hooks() {
-  local h
-  if ! command -v lefthook >/dev/null 2>&1; then
-    ask "lefthook isn't installed: brew install lefthook" && brew_install lefthook || return 1
-  fi
-  [ -f lefthook.yml ] || { note "no lefthook.yml to install from"; return 1; }
-  lefthook install >/dev/null || return 1
-  for h in $missing_hooks; do
-    grep -q lefthook "$hooks/$h" 2>/dev/null || { note "$h still missing: lefthook.yml has no $h section"; return 1; }
-  done
+    first=0
+  done <<< "$AGENT_FILES"
 }
 
-# ── checks ────────────────────────────────────────────────────────────────────
-echo "── Agent guides"
-if [ ! -f AGENTS.md ]; then
-  offer "root AGENTS.md is missing" "create it from the template" fix_root_agents
-elif grep -q '^## Memory' AGENTS.md; then
-  ok "root AGENTS.md has a Memory section"
-else
-  offer "root AGENTS.md has no '## Memory' section" "append the standard Memory section" fix_memory_section
+MODE=ask; TARGET=""; CMD=repo
+for arg in "$@"; do
+  case "$arg" in
+    link) CMD=link ;;
+    --check) MODE=check ;;
+    --yes|-y) MODE=yes ;;
+    --quiet|-q) QUIET=1 ;;
+    -h|--help) sed -n '2,16p' "$src"; exit 0 ;;
+    -*) echo "Unknown option: $arg" >&2; exit 2 ;;
+    *) TARGET="$arg" ;;
+  esac
+done
+
+if [ "$CMD" = link ]; then
+  [ "$QUIET" -eq 1 ] || echo "── Agent guide links"
+  if [ "$MODE" = check ]; then link_guides check; else link_guides fix; fi
+  exit "$fail"
 fi
-guides=$( { [ -f AGENTS.md ] && echo AGENTS.md; git ls-files | grep -E '(^|/)AGENTS\.md$'; } | sort -u)
-for f in $guides; do
-  dir=$(dirname "$f")
-  if [ -f "$dir/CLAUDE.md" ] && grep -q '@AGENTS.md' "$dir/CLAUDE.md"; then
-    ok "$dir/CLAUDE.md imports AGENTS.md"
-  else
-    offer "$dir/CLAUDE.md missing or doesn't import AGENTS.md" "add '@AGENTS.md' to $dir/CLAUDE.md" fix_claude_import "$dir"
-  fi
-  lines=$(wc -l < "$f" | tr -d ' ')
-  [ "$lines" -gt "$MAX_LINES" ] && warn "$f is $lines lines (keep under $MAX_LINES)"
-  if [ "$dir" != "." ]; then
-    if grep -qE 'root \[AGENTS\.md\]|\.\./\.\./AGENTS\.md' "$f"; then ok "$f points to the root guide"
-    else err "$f doesn't point to the root AGENTS.md"; note "add a line like: Follow the root [AGENTS.md](../../AGENTS.md) first."; fi
-  fi
-done
-for app in apps/*/; do
-  [ -d "$app" ] || continue
-  app=${app%/}
-  [ -f "$app/AGENTS.md" ] || offer "$app has no AGENTS.md" "create one pointing to the root guide" fix_app_agents "$app"
-done
+if [ "$MODE" = ask ] && ! { [ -t 0 ] && [ -t 1 ]; }; then MODE=check; fi
 
-echo "── Memory"
+# ── repo ──────────────────────────────────────────────────────────────────────
+[ -n "$TARGET" ] && { cd "$TARGET" 2>/dev/null || { echo "Not a folder: $TARGET" >&2; exit 2; }; }
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "Not inside a git repo: ${TARGET:-$PWD}" >&2; exit 2; }
+cd "$root" || exit 2
+printf 'Checking %s\n' "$root"
+flutter=0; [ -f pubspec.yaml ] && flutter=1
+
+echo; echo "── Memory"
+mk_agents()  { cp "$TPL/AGENTS.md" AGENTS.md && note "fill in the project name and build commands"; }
+add_memory() { backup AGENTS.md; { printf '\n'; cat "$TPL/memory-section.md"; } >> AGENTS.md; }
+add_import() { if [ -f CLAUDE.md ]; then backup CLAUDE.md; printf '\n@AGENTS.md\n' >> CLAUDE.md; else printf '@AGENTS.md\n' > CLAUDE.md; fi; }
+mk_memfile() { mkdir -p memory; [ -e "$1" ] || cp "$TPL/$1" "$1"; git add -- "$1"; }
+if [ ! -f AGENTS.md ]; then fix "no AGENTS.md" "create it from the template" mk_agents
+elif grep -q '^## Memory' AGENTS.md; then ok "AGENTS.md has the Memory section"
+else fix "AGENTS.md has no Memory section" "append it" add_memory; fi
+if [ -f CLAUDE.md ] && grep -q '@AGENTS.md' CLAUDE.md; then ok "CLAUDE.md imports AGENTS.md"
+else fix "CLAUDE.md doesn't import AGENTS.md (Claude won't see the rules)" "add '@AGENTS.md'" add_import; fi
 for m in memory/progress.md memory/decision.md; do
-  if [ ! -f "$m" ]; then offer "$m is missing" "create it and stage it" fix_memory_file "$m"
-  elif ! git ls-files --error-unmatch "$m" >/dev/null 2>&1; then offer "$m exists but isn't committed" "git add it" fix_memory_file "$m"
+  if [ ! -f "$m" ]; then fix "no $m" "create and stage it" mk_memfile "$m"
+  elif ! git ls-files --error-unmatch "$m" >/dev/null 2>&1; then fix "$m isn't committed" "stage it" mk_memfile "$m"
   else ok "$m tracked"; fi
 done
-if [ -f memory/progress.md ]; then
-  n=$(wc -l < memory/progress.md | tr -d ' ')
-  [ "$n" -gt 150 ] && warn "memory/progress.md is $n lines (keep under 150: remove finished items)"
+if [ -f memory/progress.md ] && [ "$(wc -l < memory/progress.md)" -gt 150 ]; then
+  warn "memory/progress.md is over 150 lines: remove finished items"
 fi
 
-echo "── Security tooling"
-conf=tools/security_tools.conf
-if [ ! -f "$conf" ]; then
-  if ! offer "no tools/security_tools.conf (the tools this repo requires)" "create it from the default list" fix_conf; then
-    conf="$TPL/security_tools.conf"; note "checking against the default list for now"
-  fi
-fi
-plugin_on() {  # plugin_on NAME@MARKETPLACE: enabled (true) in any Claude Code settings file
-  local f
-  for f in "$HOME/.claude/settings.json" .claude/settings.json .claude/settings.local.json; do
-    [ -f "$f" ] && grep -qE "\"$1\"[[:space:]]*:[[:space:]]*true" "$f" && return 0
-  done
-  return 1
-}
-# install_plugin NAME[@MARKETPLACE] (default marketplace: claude-plugins-official)
-install_plugin() {
-  local p="$1" scope f
-  command -v claude >/dev/null 2>&1 || { note "Claude Code CLI isn't installed"; return 1; }
-  case "$p" in *@*) ;; *) p="$p@claude-plugins-official" ;; esac
-  # Already installed but disabled ("…": false): enable it where it's set.
-  for f in .claude/settings.local.json .claude/settings.json "$HOME/.claude/settings.json"; do
-    if [ -f "$f" ] && grep -qE "\"$p\"[[:space:]]*:[[:space:]]*false" "$f"; then
-      note "$p is disabled in $f; enabling it"
-      backup "$f"; claude plugin enable "$p" && plugin_on "$p"; return
+echo; echo "── Git hooks (lefthook)"
+mk_lefthook() {
+  local c fl da cmd
+  if [ "$flutter" -eq 1 ]; then
+    fl=flutter; da=dart
+    if [ -f .fvmrc ]; then fl="fvm flutter"; da="fvm dart"
+    else
+      note "no .fvmrc: git hooks don't see shell aliases, so give the real commands (or pin first: fvm use <version>)"
+      command -v fvm >/dev/null 2>&1 && { fl="fvm flutter"; da="fvm dart"; }
+      fl=$(ask_value "Flutter command" "$fl"); da=$(ask_value "Dart command" "$da")
     fi
-  done
-  scope=$(ask_value "Scope: project (this repo, committed for the team) or user (all your repos)" "project")
-  case "$scope" in
-    project) f=.claude/settings.json ;;
-    user)    f="$HOME/.claude/settings.json" ;;
-    local)   f=.claude/settings.local.json ;;
-    *) note "unknown scope: $scope"; return 1 ;;
-  esac
-  backup "$f"
-  if ! claude plugin install "$p" --scope "$scope"; then
-    # The official marketplace is only added on the first interactive Claude Code session.
-    case "$p" in *@claude-plugins-official)
-      note "adding the official plugin marketplace, then retrying"
-      claude plugin marketplace add anthropics/claude-plugins-official && claude plugin install "$p" --scope "$scope" || return 1 ;;
-    *) return 1 ;;
-    esac
-  fi
-  plugin_on "$p"
-}
-install_offer() {  # install_offer TOOL REQUIRED(1|0)
-  local t="$1"
-  case "$t" in
-    plugin:*)
-      if ask "install the Claude Code plugin ${t#plugin:}"; then
-        if install_plugin "${t#plugin:}"; then note "✓ installed ${t#plugin:}"; fixed=$((fixed+1)); return; fi
-        note "install failed: try /plugin inside Claude Code"
-      fi
-      [ "$2" = 1 ] && fail=1; return ;;
-  esac
-  if ask "brew install $t"; then
-    if brew_install "$t"; then note "✓ installed $t"; fixed=$((fixed+1)); return; fi
-    note "install failed"
-  fi
-  [ "$2" = 1 ] && fail=1
-}
-out=$(bash "$HERE/check_security_tooling.sh" "$conf" 2>&1); rc=$?
-saw_fail=0
-while IFS= read -r line; do
-  case "$line" in
-    PASS*) ok "${line#PASS  }" ;;
-    SKIP*) note "${line#SKIP  }" ;;
-    WARN*) warn "${line#WARN  }"; for t in ${line##*: }; do install_offer "$t" 0; done ;;
-    FAIL*) saw_fail=1; bad "${line#FAIL  }"
-      case "$line" in
-        *"at least one of"*) set -- ${line##*: }; install_offer "$1" 1 ;;
-        *) for t in ${line##*: }; do install_offer "$t" 1; done ;;
-      esac ;;
-    ERROR*) err "$line" ;;
-  esac
-done <<< "$out"
-[ "$rc" -ne 0 ] && [ "$saw_fail" -eq 0 ] && err "security tooling check failed: $out"
-if [ -f .gitleaks.toml ]; then
-  if grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' .gitleaks.toml || grep -q '^\[\[rules\]\]' .gitleaks.toml; then
-    ok ".gitleaks.toml keeps the default rules"
+    c=$(cat "$TPL/lefthook.flutter.yml"); c=${c//@@FLUTTER@@/"$fl"}; c=${c//@@DART@@/"$da"}
   else
-    err ".gitleaks.toml has no rules"; note "add '[extend]' + 'useDefault = true' at the top"
+    cmd=""; [ -f package.json ] && cmd="npm test"; [ -f go.mod ] && cmd="go test ./..."; [ -f pyproject.toml ] && cmd="pytest"
+    cmd=$(ask_value "Test command" "$cmd"); [ -n "$cmd" ] || { note "no test command"; return 1; }
+    c=$(cat "$TPL/lefthook.generic.yml"); c=${c//@@TEST@@/"$cmd"}
   fi
+  backup lefthook.yml; printf '%s\n' "$c" > lefthook.yml && note "review lefthook.yml, then commit it"
+}
+has_content() { grep -qvE '^[[:space:]]*(#.*)?$' "$1"; }
+if [ ! -f lefthook.yml ]; then fix "no lefthook.yml" "create it from the template" mk_lefthook
+elif ! has_content lefthook.yml; then fix "lefthook.yml is only the commented example" "replace it with the template" mk_lefthook; fi
+if [ -f lefthook.yml ] && has_content lefthook.yml; then
+  chk() { if grep -qiE "$1" lefthook.yml; then ok "lefthook runs $2"; else err "lefthook.yml doesn't run $2"; note "add: $3"; fi; }
+  chk 'gitleaks[[:space:]]+(git|dir|protect|detect)' "gitleaks" 'gitleaks git --no-banner --redact --log-opts="HEAD --not --remotes"'
+  [ "$flutter" -eq 1 ] && chk 'flutter analyze|dart analyze' "the analyzer" 'fvm flutter analyze --no-pub {push_files}'
+  chk '(name:[[:space:]]*[a-z0-9_-]*test|^[[:space:]]+[a-z0-9_-]*test[a-z0-9_-]*:)' "the tests" 'a pre-push job named "test"'
+  chk 'code-review|ai-review' "the AI review reminder" 'a pre-push job named "ai-review-reminder" that prints a reminder'
+  if grep -q 'ai-setup link' lefthook.yml; then ok "lefthook refreshes the agent guide links"
+  else warn "lefthook.yml doesn't refresh the agent guide links"; note "add a pre-push job: command -v ai-setup >/dev/null 2>&1 && ai-setup link --quiet || true"; fi
 fi
-# Flutter repos: the built-in rules miss keystores, signing passwords and Apple keys.
-is_flutter=0; git ls-files | grep -qE '(^|/)pubspec\.yaml$' && is_flutter=1
-fix_gitleaks_new() { [ -e .gitleaks.toml ] || cp "$TPL/gitleaks.flutter.toml" .gitleaks.toml; note "created .gitleaks.toml: commit it"; }
-fix_gitleaks_rules() {
-  backup .gitleaks.toml; cat "$TPL/gitleaks-mobile-rules.toml" >> .gitleaks.toml
-  note "appended the mobile rules. To skip Firebase client config, add this to [allowlist]:"
-  note "  paths = ['''google-services\.json\$''', '''GoogleService-Info\.plist\$''', '''firebase_options\.dart\$''']"
-}
-if [ "$is_flutter" -eq 1 ]; then
-  if [ ! -f .gitleaks.toml ]; then
-    offer "no .gitleaks.toml: the built-in rules miss keystores, signing passwords and Apple keys" "create one with the mobile rules" fix_gitleaks_new
-  elif grep -q 'android-keystore-file' .gitleaks.toml; then
-    ok ".gitleaks.toml has the mobile signing rules"
-  else
-    offer ".gitleaks.toml lacks the mobile signing rules (keystores, signing passwords, Apple keys)" "append them (backed up first)" fix_gitleaks_rules
-  fi
-elif [ ! -f .gitleaks.toml ]; then
-  ok "gitleaks uses its built-in rules (no .gitleaks.toml)"
+hooks=$(git rev-parse --git-path hooks); missing=""
+for h in pre-commit pre-push commit-msg; do grep -q lefthook "$hooks/$h" 2>/dev/null || missing="$missing $h"; done
+inst_hooks() { command -v lefthook >/dev/null 2>&1 || { note "lefthook isn't installed (brew install lefthook)"; return 1; }; lefthook install >/dev/null; }
+if [ -z "$missing" ]; then ok "hooks installed"; else fix "hooks not installed:$missing" "run lefthook install" inst_hooks; fi
+
+echo; echo "── Secrets (gitleaks)"
+mk_gitleaks() { cp "$TPL/gitleaks.flutter.toml" .gitleaks.toml; }
+add_rules()   { backup .gitleaks.toml; cat "$TPL/gitleaks-mobile-rules.toml" >> .gitleaks.toml; }
+if [ -f .gitleaks.toml ]; then
+  if grep -qE '^[[:space:]]*useDefault[[:space:]]*=[[:space:]]*true' .gitleaks.toml; then ok ".gitleaks.toml keeps the built-in rules"
+  else err ".gitleaks.toml drops the built-in rules"; note "add at the top: [extend] + useDefault = true"; fi
+fi
+if [ "$flutter" -eq 1 ]; then
+  if [ ! -f .gitleaks.toml ]; then fix "no .gitleaks.toml (built-in rules miss keystores, signing passwords, Apple keys)" "create it" mk_gitleaks
+  elif grep -q 'android-keystore-file' .gitleaks.toml; then ok ".gitleaks.toml has the mobile rules"
+  else fix ".gitleaks.toml has no mobile rules" "append them" add_rules; fi
 fi
 if command -v gitleaks >/dev/null 2>&1; then
-  canary=$(mktemp -d)
-  printf 'token = "ghp_%s"\n' "1a2b3c4d5e6f7g8h9i0jKLMNOPQRSTUVWXyz12" > "$canary/canary.txt"
+  tmp=$(mktemp -d); printf 'token = "ghp_%s"\n' "1a2b3c4d5e6f7g8h9i0jKLMNOPQRSTUVWXyz12" > "$tmp/c.txt"
   cfg=""; [ -f .gitleaks.toml ] && cfg="--config=.gitleaks.toml"
-  gitleaks dir --no-banner --log-level error $cfg --report-format json \
-    --report-path "$canary/report.json" "$canary/canary.txt" >/dev/null 2>&1
-  if grep -q '"RuleID"' "$canary/report.json" 2>/dev/null; then ok "gitleaks catches a planted fake token"
-  else err "gitleaks missed a planted fake token with this repo's config"; fi
-  # Whole history, not just new commits: a secret committed long ago is still in every clone.
-  # Skipped with --push (the pre-push hook already scans what's being pushed).
-  if [ "$PUSH" -eq 0 ]; then
-    gitleaks git --no-banner --redact --log-level error --report-format json \
-      --report-path "$canary/history.json" . >/dev/null 2>&1
-    found=$(awk -F'"' '/"RuleID":/{r=$4} /"File":/{f=$4} /"Commit":/{c=substr($4,1,8)} /"Fingerprint":/{print r"  "f"  (first in "c")"}' "$canary/history.json" 2>/dev/null | sort -u)
-    if [ -z "$found" ]; then
-      ok "no secrets anywhere in the git history"
-    else
-      err "secrets in the git history ($(printf '%s\n' "$found" | wc -l | tr -d ' ') findings):"
-      printf '%s\n' "$found" | head -15 | sed 's/^/      /'
-      note "Real secret: rotate it first, then stop tracking the file (it stays in history; rewrite only after rotating)."
-      note "Not a secret (e.g. a restricted API key): add its Fingerprint to .gitleaksignore."
-      note "Details: gitleaks git --redact -v ."
-    fi
-  fi
-  rm -rf "$canary"
+  gitleaks dir --no-banner --log-level error $cfg --report-format json --report-path "$tmp/r.json" "$tmp/c.txt" >/dev/null 2>&1
+  grep -q '"RuleID"' "$tmp/r.json" 2>/dev/null && ok "gitleaks catches a planted fake token" || err "gitleaks missed a planted fake token with this config"
+  rm -rf "$tmp"
 fi
 
-echo "── Git hooks"
-if [ ! -f lefthook.yml ]; then
-  offer "no lefthook.yml" "create one from the template" make_lefthook
-elif ! grep -qvE '^[[:space:]]*(#.*)?$' lefthook.yml; then
-  offer "lefthook.yml is only lefthook's commented example" "replace it with the template" make_lefthook
-fi
-if [ -f lefthook.yml ] && grep -qvE '^[[:space:]]*(#.*)?$' lefthook.yml; then
-  grep -qE 'gitleaks[[:space:]]+(git|dir|protect|detect)' lefthook.yml && ok "a hook runs gitleaks" \
-    || { err "lefthook.yml doesn't run gitleaks"; note "add a pre-push job: gitleaks git --no-banner --redact --log-opts=\"HEAD --not --remotes\""; }
-  grep -qE '(name:[[:space:]]*[a-z0-9_-]*test|^[[:space:]]+[a-z0-9_-]*test[a-z0-9_-]*:[[:space:]]*$)' lefthook.yml && ok "a hook runs the tests" \
-    || { err "lefthook.yml has no test job"; note "add a pre-push job named 'test' that runs your tests"; }
-  grep -qiE 'code-review|ai-review' lefthook.yml && ok "a hook reminds about the AI code review" \
-    || { err "lefthook.yml has no AI review reminder"; note "add a pre-push job named 'ai-review-reminder' that prints a reminder"; }
-fi
-hooks=$(git rev-parse --git-path hooks)
-missing_hooks=""
-for h in pre-commit pre-push commit-msg; do
-  if grep -q lefthook "$hooks/$h" 2>/dev/null; then ok "$h hook installed"; else missing_hooks="$missing_hooks $h"; fi
-done
-[ -n "$missing_hooks" ] && offer "hooks not installed:$missing_hooks" "run lefthook install" fix_hooks
-
-echo "── CI"
-ci_files=$(ls .github/workflows/*.yml .github/workflows/*.yaml .gitlab-ci.yml bitbucket-pipelines.yml 2>/dev/null)
-if [ -z "$ci_files" ]; then
-  warn "no CI found: hooks can be skipped (--no-verify), so CI is the only real gate"
-elif grep -qi 'gitleaks' $ci_files 2>/dev/null; then
-  ok "CI runs gitleaks"
-else
-  warn "CI doesn't run gitleaks: hooks can be skipped, CI can't"
+if [ "$flutter" -eq 1 ]; then
+  echo; echo "── Static analysis"
+  mk_analysis() { cp "$TPL/analysis_options.yaml" analysis_options.yaml; }
+  if [ ! -f analysis_options.yaml ]; then fix "no analysis_options.yaml" "create it (flutter_lints + stricter rules)" mk_analysis
+  elif grep -qE '^include:[[:space:]]*package:(flutter_lints|lints|very_good_analysis)' analysis_options.yaml; then ok "analysis_options.yaml includes a lint set"
+  else warn "analysis_options.yaml doesn't include a lint set (e.g. include: package:flutter_lints/flutter.yaml)"; fi
+  grep -qE '^[[:space:]]+(flutter_lints|lints|very_good_analysis):' pubspec.yaml && ok "lint package in pubspec.yaml" \
+    || warn "no lint package in pubspec.yaml: fvm flutter pub add --dev flutter_lints"
 fi
 
-echo "── Claude Code guardrails"
-# Deny rules stop Claude (not other agents) from skipping hooks or editing the gates.
-# They match command text, so they're a guardrail, not a security boundary.
-# LEFTHOOK=0 can't be matched reliably by a rule; the global guide covers it.
-DENY_RULES='Bash(git * --no-verify*)
-Bash(git commit -n*)
-Bash(git commit * -n*)
-Edit(/lefthook.yml)
-Edit(/.gitleaks.toml)
-Edit(/tools/security_tools.conf)'
-missing_rules=""
-while IFS= read -r r; do
-  found=0
-  for f in .claude/settings.json .claude/settings.local.json; do
-    [ -f "$f" ] && grep -qF "\"$r\"" "$f" && found=1
-  done
-  [ "$found" -eq 1 ] || missing_rules="$missing_rules$r
-"
-done <<< "$DENY_RULES"
-fix_deny() {
-  local f=.claude/settings.json tmp json
-  json=$(printf '%s' "$missing_rules" | awk 'NF{gsub(/"/,"\\\"");printf "%s\"%s\"",(n++?",":""),$0} END{}' | sed 's/^/[/; s/$/]/')
-  mkdir -p .claude; [ -f "$f" ] || printf '{}\n' > "$f"
-  backup "$f"; tmp=$(mktemp)
-  if command -v jq >/dev/null 2>&1; then
-    jq --argjson r "$json" '.permissions.deny = ((.permissions.deny // []) + $r)' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
-  elif command -v python3 >/dev/null 2>&1 && python3 -c 'import json' 2>/dev/null; then
-    python3 - "$f" "$json" > "$tmp" <<'PY' || { rm -f "$tmp"; return 1; }
-import json, sys
-d = json.load(open(sys.argv[1]))
-d.setdefault("permissions", {}).setdefault("deny", []).extend(json.loads(sys.argv[2]))
-print(json.dumps(d, indent=2))
-PY
-  else
-    rm -f "$tmp"; note "needs jq or python3; add these to permissions.deny in $f by hand:"; printf '%s' "$missing_rules" | sed 's/^/      /'; return 1
-  fi
-  cat "$tmp" > "$f"; rm -f "$tmp"
-  note "updated $f: commit it so the team gets the same rules"
+echo; echo "── Tools (tools.conf: warn only)"
+plugin_on() {
+  local f
+  for f in "$HOME/.claude/settings.json" .claude/settings.json .claude/settings.local.json; do
+    [ -f "$f" ] && grep -qE "\"$1(@[^\"]*)?\"[[:space:]]*:[[:space:]]*true" "$f" && return 0
+  done; return 1
 }
-if [ -z "$missing_rules" ]; then
-  ok "Claude can't skip hooks or edit the hook/security config"
-else
-  offer_warn "Claude Code deny rules missing:$(printf '%s' "$missing_rules" | tr '\n' ' ' | sed 's/ Bash/, Bash/g; s/ Edit/, Edit/g; s/^/ /')" "add them to .claude/settings.json" fix_deny
-fi
+if [ -f "$TOOLS" ]; then
+  while read -r level when tool how; do
+    case "$level" in ""|\#*) continue ;; esac
+    [ "$when" = flutter ] && [ "$flutter" -eq 0 ] && continue
+    case "$tool" in plugin:*) plugin_on "${tool#plugin:}" && have=1 || have=0 ;;
+                    *) command -v "$tool" >/dev/null 2>&1 && have=1 || have=0 ;; esac
+    if [ "$have" -eq 1 ]; then ok "$tool"
+    elif [ "$level" = required ]; then warn "missing required tool: $tool  →  $how"
+    else warn "recommended: $tool  →  $how"; fi
+  done < "$TOOLS"
+else warn "no $TOOLS"; fi
 
-echo "── Global agent guide (this machine)"
-G="$HOME/.agents/AGENTS.md"; MINE="$(dirname "$HERE")/AGENTS.md"
-fix_global() {
-  mkdir -p "$HOME/.agents"
-  [ -e "$G" ] || [ -L "$G" ] && return 1
-  if [ -f "$MINE" ]; then ln -s "$MINE" "$G" && note "$G -> $MINE"
-  else cp "$TPL/global-AGENTS.md" "$G" && note "created $G: edit it to taste"; fi
-}
-fix_claude_global() { local f="$HOME/.claude/CLAUDE.md"; mkdir -p "$HOME/.claude"; backup "$f"; printf '\n@~/.agents/AGENTS.md\n' >> "$f"; }
-fix_codex_link() { mkdir -p "$HOME/.codex"; ln -s "$G" "$HOME/.codex/AGENTS.md"; }
-# The real guide lives in this setup's folder ($MINE); ~/.agents/AGENTS.md should link to it.
-fix_global_link() {
-  local b="$G.bak-$(date +%Y%m%d%H%M%S)"
-  mv -n "$G" "$b" && note "moved the old copy to $b" && ln -s "$MINE" "$G"
-}
-if [ -L "$G" ] && [ "$(readlink "$G")" = "$MINE" ]; then ok "~/.agents/AGENTS.md links to $MINE"
-elif [ -f "$G" ] && [ -f "$MINE" ] && [ ! -L "$G" ]; then
-  offer_warn "~/.agents/AGENTS.md is a separate copy, not a link to $MINE (they'll drift)" \
-    "replace it with a link (the copy is kept as .bak; merge anything you need from it)" fix_global_link
-elif [ -f "$G" ]; then ok "~/.agents/AGENTS.md exists"
-else offer_warn "no global guide at ~/.agents/AGENTS.md" "create it" fix_global; fi
-if [ -f "$G" ]; then
-  grep -qF '@~/.agents/AGENTS.md' "$HOME/.claude/CLAUDE.md" 2>/dev/null && ok "~/.claude/CLAUDE.md imports it" \
-    || offer_warn "~/.claude/CLAUDE.md doesn't import it" "append '@~/.agents/AGENTS.md' (backed up first)" fix_claude_global
-  if [ "$(readlink "$HOME/.codex/AGENTS.md" 2>/dev/null)" = "$G" ]; then ok "~/.codex/AGENTS.md links to it"
-  elif [ -e "$HOME/.codex/AGENTS.md" ] || [ -L "$HOME/.codex/AGENTS.md" ]; then
-    warn "~/.codex/AGENTS.md exists but isn't a link to it"; note "merge it into $G, move it aside, then re-run"
-  else offer_warn "~/.codex/AGENTS.md doesn't link to it" "create the link" fix_codex_link; fi
-fi
+echo; echo "── Agent guide links"
+link_guides check
 
-echo "── Architecture"
-if ! git ls-files | grep -qE '(^|/)pubspec\.yaml$'; then
-  note "Cubit rule skipped (not a Flutter repo)"
-else
-bad_files=$(git ls-files 'apps/*/lib/**/cubit/*.dart' 'packages/*/lib/**/cubit/*.dart' \
-  | xargs grep -lE "^import .*(package:dio/|_api_client\.dart|_rest_client\.dart|/data/)" 2>/dev/null)
-if [ -n "$bad_files" ]; then
-  err "Cubits must go through a repository; direct data access in:"
-  printf '    %s\n' $bad_files
-else
-  ok "no Cubit imports Dio, API clients or data sources"
-fi
-fi
-
-if [ "$PUSH" -eq 1 ]; then
-  echo "── Progress"
-  base=$(git merge-base HEAD "${BASE_REF:-origin/main}" 2>/dev/null)
-  if [ -n "$base" ]; then
-    changed=$(git diff --name-only "$base"...HEAD)
-    if echo "$changed" | grep -qE '(^|/)lib/' && ! echo "$changed" | grep -qx 'memory/progress.md'; then
-      warn "code changed on this branch but memory/progress.md didn't; update it before handing off"
-    else
-      ok "progress.md is in step with the branch"
-    fi
-  fi
-fi
-
-if [ "$fixed" -gt 0 ]; then
-  printf '\n\033[1m%d fix(es) applied. Re-checking...\033[0m\n\n' "$fixed"
-  if [ "$PUSH" -eq 1 ]; then exec "$HERE/ai-setup" --check --push "$root"; else exec "$HERE/ai-setup" --check "$root"; fi
-fi
 [ "$fail" -eq 0 ] && printf '\n\033[1;32mAI setup OK\033[0m\n' || printf '\n\033[1;31mAI setup has problems (see ✗ above)\033[0m\n'
 exit "$fail"
