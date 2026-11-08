@@ -57,3 +57,14 @@ Write commit messages as if authored by the user.
 - Default to the safe form: back up first (`cp -n`, `mv x x.bak`), omit force flags (`-f`, `--force`, `--hard`), or use a dry run (`-n`, `--dry-run`).
 - If the destructive form is really needed, ask for my confirmation before giving or running it.
 - This applies to commands you hand me to run manually, not only commands you run yourself.
+
+## Memory: read first, update last
+
+Project state lives in `memory/`, in the repo. Any agent or engineer can pick up from it.
+
+- **Start of a session:** read `memory/*`.
+- **End of a session (or before a push):** update your task's section in `progress.md`: status, next step, blockers.
+- **When you choose between options:** add an entry to `decision.md` (append only, never rewrite old entries).
+- **A fact that stays true** (a convention, a gotcha) goes in the repo's `AGENTS.md`, not in `memory/`.
+- Commit `memory/` with the code it describes.
+

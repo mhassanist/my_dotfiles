@@ -7,7 +7,7 @@
 #
 #   ai-setup [--check | --yes] [path]
 #       Sets up and checks a code repo (default: the current folder):
-#       memory (AGENTS.md Memory section, CLAUDE.md import, memory/*.md), lefthook hooks
+#       memory (Memory section in the global guide, memory/*.md, CLAUDE.md import), lefthook hooks
 #       (gitleaks, analyze, tests, AI review reminder), .gitleaks.toml, analysis_options.yaml
 #       (Flutter), tools from tools.conf (warn only), and the agent guide links.
 #       Asks y/N before each change; --check only reports; --yes applies everything.
@@ -123,14 +123,19 @@ flutter=0; [ -f pubspec.yaml ] && flutter=1
 
 echo; echo "── Memory"
 mk_agents()  { cp "$TPL/AGENTS.md" AGENTS.md && note "fill in the project name and build commands"; }
-add_memory() { backup AGENTS.md; { printf '\n'; cat "$TPL/memory-section.md"; } >> AGENTS.md; }
+add_memory() { backup "$GUIDE"; { printf '\n'; cat "$TPL/memory-section.md"; } >> "$GUIDE"; }
 add_import() { if [ -f CLAUDE.md ]; then backup CLAUDE.md; printf '\n@AGENTS.md\n' >> CLAUDE.md; else printf '@AGENTS.md\n' > CLAUDE.md; fi; }
 mk_memfile() { mkdir -p memory; [ -e "$1" ] || cp "$TPL/$1" "$1"; git add -- "$1"; }
-if [ ! -f AGENTS.md ]; then fix "no AGENTS.md" "create it from the template" mk_agents
-elif grep -q '^## Memory' AGENTS.md; then ok "AGENTS.md has the Memory section"
-else fix "AGENTS.md has no Memory section" "append it" add_memory; fi
-if [ -f CLAUDE.md ] && grep -q '@AGENTS.md' CLAUDE.md; then ok "CLAUDE.md imports AGENTS.md"
-else fix "CLAUDE.md doesn't import AGENTS.md (Claude won't see the rules)" "add '@AGENTS.md'" add_import; fi
+# The Memory rules live once, in the global guide. (Shared repos can keep their own copy for teammates.)
+if grep -q '^## Memory' "$GUIDE" 2>/dev/null; then ok "global guide has the Memory section"
+else fix "global guide ($(tilde "$GUIDE")) has no Memory section" "append it" add_memory; fi
+if [ "$root" -ef "$ROOT" ]; then
+  : # ~/.ai-msaudi itself: its AGENTS.md is the global guide, already loaded by every agent
+else
+  if [ ! -f AGENTS.md ]; then fix "no AGENTS.md" "create it from the template" mk_agents; else ok "AGENTS.md exists"; fi
+  if [ -f CLAUDE.md ] && grep -q '@AGENTS.md' CLAUDE.md; then ok "CLAUDE.md imports AGENTS.md"
+  else fix "CLAUDE.md doesn't import AGENTS.md (Claude won't see the project rules)" "add '@AGENTS.md'" add_import; fi
+fi
 for m in memory/progress.md memory/decision.md; do
   if [ ! -f "$m" ]; then fix "no $m" "create and stage it" mk_memfile "$m"
   elif ! git ls-files --error-unmatch "$m" >/dev/null 2>&1; then fix "$m isn't committed" "stage it" mk_memfile "$m"
