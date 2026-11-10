@@ -6,6 +6,15 @@
 - Prioritize long-term maintainability, strict typing, and testability over brevity.
 - Don't add abstractions, layers, or configurability the task doesn't need.
 
+## Long-running jobs
+
+- Any job that could run for hours (batch processing, migrations, scraping, training, bulk API calls) must be resumable:
+  - Save progress (checkpoints) as it goes, so a restart continues from the last checkpoint instead of from zero.
+  - Make each step safe to run twice (idempotent), so a resumed run doesn't duplicate work or data.
+  - Record per-item failures and keep going; retry transient errors with backoff. Report the failed items at the end.
+  - Log progress (done / total, rough time left).
+- Before running it, say how it resumes and test that by interrupting it once.
+
 ## Bug fixing
 
 - Before changing any code, reproduce the bug or crash and confirm you see the reported failure.
@@ -67,4 +76,3 @@ Project state lives in `memory/`, in the repo. Any agent or engineer can pick up
 - **When you choose between options:** add an entry to `decision.md` (append only, never rewrite old entries).
 - **A fact that stays true** (a convention, a gotcha) goes in the repo's `AGENTS.md`, not in `memory/`.
 - Commit `memory/` with the code it describes.
-
